@@ -1,0 +1,4 @@
+latest.json
+config.json
+*.tmp
+__pycache__/
