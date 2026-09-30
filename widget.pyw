@@ -1,16 +1,22 @@
 """Claude Usage Meter: a Windows XP style desktop widget for Claude Code plan usage.
 
 Reads latest.json, which statusline.py writes whenever Claude Code refreshes
-its status line. Right-click the window for options.
+its status line. The refresh button asks Claude Code for fresh numbers with a
+tiny headless Haiku request. Right-click the window for options.
 """
 import ctypes
 import json
 import os
+import shutil
+import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
 from ctypes import wintypes
 from datetime import datetime
+
+import statusline
 
 APP_TITLE = "Claude Usage Meter"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -176,6 +182,61 @@ def reset_text(resets_at, now):
     return f"Resets in {span} ({clock(resets_at)})"
 
 
+# Smallest request Claude Code can make on the subscription login: no tools,
+# MCP servers, settings, or session file. Costs a few hundred Haiku tokens.
+FETCH_ARGS = ["-p", "Reply with just: ok", "--model", "haiku", "--tools", "",
+              "--strict-mcp-config", "--setting-sources", "", "--system-prompt", "Reply briefly.",
+              "--disable-slash-commands", "--no-session-persistence",
+              "--output-format", "stream-json", "--verbose"]
+FETCH_TIMEOUT = 60
+
+
+def claude_exe():
+    path = shutil.which("claude")
+    if path and path.lower().endswith(".cmd"):
+        # Call the npm shim's target directly; cmd.exe mangles empty arguments.
+        exe = os.path.join(os.path.dirname(path), "node_modules", "@anthropic-ai",
+                           "claude-code", "bin", "claude.exe")
+        if os.path.exists(exe):
+            return exe
+    return path
+
+
+def fetch_usage():
+    """Run a headless Claude Code request and return its rate limits in the
+    status line format. Raises RuntimeError with a short reason on failure."""
+    exe = claude_exe()
+    if not exe:
+        raise RuntimeError("claude not found")
+    try:
+        proc = subprocess.run([exe] + FETCH_ARGS, cwd=HERE, capture_output=True,
+                              timeout=FETCH_TIMEOUT, stdin=subprocess.DEVNULL,
+                              creationflags=subprocess.CREATE_NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("timed out")
+    except OSError:
+        raise RuntimeError("couldn't start claude")
+    limits, result = {}, None
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("type") == "rate_limit_event":
+            windows = (event.get("rate_limit_info") or {}).get("unifiedWindows") or {}
+            for key, win in windows.items():
+                if win.get("utilization") is not None:
+                    limits[key] = {"used_percentage": round(win["utilization"] * 100, 1),
+                                   "resets_at": win.get("resetsAt")}
+        elif event.get("type") == "result":
+            result = event
+    if limits:
+        return limits
+    if result and result.get("is_error"):
+        raise RuntimeError(str(result.get("result") or "request failed")[:40])
+    raise RuntimeError("no usage in reply")
+
+
 def ago(seconds):
     if seconds < 60:
         return "just now"
@@ -196,6 +257,9 @@ class Meter:
         self.data = None
         self.data_mtime = None
         self.drag_from = None
+        self.fetching = None  # background thread while a refresh runs
+        self.fetch_result = None
+        self.notice = None  # (text, shown until) for refresh errors
 
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
@@ -214,7 +278,7 @@ class Meter:
         self.menu.add_checkbutton(label="Always on top", variable=self.topmost,
                                   command=self.toggle_topmost)
         self.menu.add_command(label="Move to bottom-right", command=self.snap_corner)
-        self.menu.add_command(label="Refresh", command=self.refresh)
+        self.menu.add_command(label="Refresh now", command=self.refresh)
         self.menu.add_separator()
         self.menu.add_command(label="Exit", command=self.quit)
         self.canvas.bind("<Button-3>", lambda e: self.menu.tk_popup(e.x_root, e.y_root))
@@ -310,6 +374,32 @@ class Meter:
             self.data = load_json(DATA_FILE, None) if mtime else None
 
     def refresh(self):
+        if self.fetching:
+            return
+        self.notice = None
+        self.fetch_result = None
+        self.fetching = threading.Thread(target=self.fetch_worker, daemon=True)
+        self.fetching.start()
+        self.draw()
+        self.root.after(100, self.poll_fetch)
+
+    def fetch_worker(self):
+        # Runs off the Tk thread; poll_fetch picks up the result.
+        try:
+            self.fetch_result = ("ok", fetch_usage())
+        except RuntimeError as e:
+            self.fetch_result = ("error", str(e))
+
+    def poll_fetch(self):
+        if self.fetching.is_alive():
+            self.root.after(100, self.poll_fetch)
+            return
+        self.fetching = None
+        status, value = self.fetch_result or ("error", "request failed")
+        if status == "ok":
+            statusline.save(value, fresh=True)
+        else:
+            self.notice = (f"Refresh failed: {value}", time.time() + 15)
         self.reload(force=True)
         self.draw()
 
@@ -444,6 +534,8 @@ class Meter:
         by = (TITLE_H - BTN) // 2
         close_x = W - SIDE - 3 - BTN
         min_x = close_x - BTN - 2
+        refresh_x = min_x - BTN - 2
+        self.draw_button(refresh_x, by, ("#6FA8FF", "#2863E4"), "refresh", self.refresh)
         self.draw_button(min_x, by, ("#6FA8FF", "#2863E4"), "min", self.minimize)
         self.draw_button(close_x, by, ("#F09A7C", "#C9431F"), "close", self.quit)
 
@@ -463,6 +555,13 @@ class Meter:
         if kind == "close":
             c.create_line(x + 6, y + 6, x + 15, y + 15, fill="white", width=2, tags=tag)
             c.create_line(x + 15, y + 6, x + 6, y + 15, fill="white", width=2, tags=tag)
+        elif kind == "refresh":
+            # circular arrow, gap at the top right
+            cx, cy = x + 10, y + 11
+            c.create_arc(cx - 5, cy - 5, cx + 5, cy + 5, start=70, extent=290, style="arc",
+                         outline="white", width=2, tags=tag)
+            c.create_polygon(cx + 2, cy - 1, cx + 8, cy - 1, cx + 5, cy - 5,
+                             fill="white", outline="", tags=tag)
         else:
             c.create_rectangle(x + 5, y + 13, x + 11, y + 15, fill="white", outline="", tags=tag)
         c.tag_bind(tag, "<ButtonRelease-1>", lambda e: action())
@@ -519,7 +618,13 @@ class Meter:
         top = height - SIDE - STATUS_H
         c.create_line(SIDE, top, W - SIDE, top, fill="#ACA899")
         c.create_line(SIDE, top + 1, W - SIDE, top + 1, fill="white")
-        if self.data:
+        if self.notice and now > self.notice[1]:
+            self.notice = None
+        if self.fetching:
+            text, color = "Checking usage...", TEXT
+        elif self.notice:
+            text, color = self.notice[0], "#C9431F"
+        elif self.data:
             age = now - self.data.get("captured_at", now)
             text = f"Updated {ago(age)}"
             if self.data.get("model"):

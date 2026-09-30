@@ -14,14 +14,6 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "latest.json")
 
-try:
-    data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
-except ValueError:
-    data = {}
-
-model = (data.get("model") or {}).get("display_name") or "Claude"
-limits = data.get("rate_limits") or {}
-
 
 def is_stale(new, old):
     """True if `new` is an older reading than `old`. Several Claude Code sessions
@@ -37,32 +29,50 @@ def is_stale(new, old):
         return False
 
 
-if limits:
+def save(limits, model=None, fresh=False):
+    """Merge `limits` into latest.json and return what was kept. `fresh` marks a
+    reading just fetched from the API, which always updates the timestamp."""
     try:
         with open(OUT, encoding="utf-8") as f:
-            previous = json.load(f).get("rate_limits") or {}
+            previous = json.load(f)
+        previous_limits = previous.get("rate_limits") or {}
     except (OSError, ValueError, AttributeError):
-        previous = {}
-    stale = [k for k in limits if k in previous and is_stale(limits[k], previous[k])]
+        previous, previous_limits = {}, {}
+    limits = dict(limits)
+    stale = [k for k in limits if k in previous_limits and is_stale(limits[k], previous_limits[k])]
     for key in stale:
-        limits[key] = previous[key]
+        limits[key] = previous_limits[key]
+    if limits and (fresh or len(stale) < len(limits)):
+        snapshot = {"captured_at": time.time(),
+                    "model": model or previous.get("model") or "Claude",
+                    "rate_limits": limits}
+        try:
+            fd, tmp = tempfile.mkstemp(dir=HERE, suffix=".tmp")
+            with os.fdopen(fd, "w") as f:
+                json.dump(snapshot, f)
+            os.replace(tmp, OUT)
+        except OSError:
+            pass
+    return limits
 
-if limits and len(stale) < len(limits):
-    snapshot = {"captured_at": time.time(), "model": model, "rate_limits": limits}
+
+if __name__ == "__main__":
     try:
-        fd, tmp = tempfile.mkstemp(dir=HERE, suffix=".tmp")
-        with os.fdopen(fd, "w") as f:
-            json.dump(snapshot, f)
-        os.replace(tmp, OUT)
-    except OSError:
-        pass
+        data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
+    except ValueError:
+        data = {}
 
-parts = [model]
-ctx = (data.get("context_window") or {}).get("used_percentage")
-if ctx is not None:
-    parts.append(f"ctx {ctx:.0f}%")
-for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
-    pct = (limits.get(key) or {}).get("used_percentage")
-    if pct is not None:
-        parts.append(f"{label} {pct:.0f}%")
-print(" | ".join(parts))
+    model = (data.get("model") or {}).get("display_name") or "Claude"
+    limits = data.get("rate_limits") or {}
+    if limits:
+        limits = save(limits, model)
+
+    parts = [model]
+    ctx = (data.get("context_window") or {}).get("used_percentage")
+    if ctx is not None:
+        parts.append(f"ctx {ctx:.0f}%")
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        pct = (limits.get(key) or {}).get("used_percentage")
+        if pct is not None:
+            parts.append(f"{label} {pct:.0f}%")
+    print(" | ".join(parts))
