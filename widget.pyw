@@ -445,19 +445,22 @@ class Meter:
         # An expired login is renewed by one headless request; automatic checks
         # don't repeat that more than every FALLBACK_GAP if it keeps failing.
         fallback = manual or time.time() - self.last_fallback > FALLBACK_GAP
-        self.fetching = threading.Thread(target=self.fetch_worker, args=(fallback,), daemon=True)
+        self.fetching = threading.Thread(target=self.fetch_worker, args=(fallback, manual),
+                                         daemon=True)
         self.fetching.start()
         if manual:
             self.draw()
         self.root.after(100, self.poll_fetch)
 
-    def fetch_worker(self, fallback):
-        # Runs off the Tk thread; poll_fetch picks up the result.
+    def fetch_worker(self, fallback, manual):
+        # Runs off the Tk thread; poll_fetch picks up the result. Automatic
+        # checks fall back to the headless request only for an expired login;
+        # the button falls back whenever the endpoint check fails.
         try:
             try:
                 self.fetch_result = ("ok", fetch_api())
-            except LoginExpired:
-                if not fallback:
+            except RuntimeError as e:
+                if not fallback or not (manual or isinstance(e, LoginExpired)):
                     raise
                 self.last_fallback = time.time()
                 self.fetch_result = ("ok", fetch_headless())
