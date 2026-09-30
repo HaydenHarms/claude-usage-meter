@@ -7,20 +7,24 @@ A tiny Windows XP–style desktop widget that shows your Claude Code plan usage 
 - **Session and weekly bars** with a reset countdown, turning yellow at 75% and red at 90%
 - **Live taskbar button**: the icon is a mini progress bar that fills with your session usage, and Windows' own taskbar progress indicator tracks it too (hover for both numbers)
 - **Sits bottom-right**, always on top (toggleable), draggable, remembers where you put it
-- **Refresh button** in the title bar fetches your current usage on demand (see below)
-- No dependencies beyond Python and Pillow; no API keys
+- **Live**: checks your usage every 2 minutes, and whenever you click ↻, without using any of your plan (see below)
+- No dependencies beyond Python and Pillow; no API keys to set up
 
 ## How it works
 
 Claude Code sends session JSON — including `rate_limits.five_hour` and `rate_limits.seven_day` — to your [status line](https://code.claude.com/docs/en/statusline) script on every refresh. `statusline.py` saves those numbers to `latest.json` and prints a short status line; `widget.pyw` watches that file and draws the meter.
 
-Rate-limit data is only available to Claude Pro and Max subscribers, and the meter updates while Claude Code is in use. When you step away it keeps the last reading and shows how old it is; a window drops to 0% once its reset time passes.
+Rate-limit data is only available to Claude Pro and Max subscribers, and the widget needs a Claude Code login on this machine. If it can't check, it keeps the last reading and shows how old it is; a window drops to 0% once its reset time passes.
 
 Every open Claude Code session writes to the same file, and an idle one still carries the numbers from its last request. `statusline.py` ignores a reading that's lower than the saved one in the same window (usage only goes up until a reset), so a stale session can't roll the meter back.
 
-### Refresh button
+### Live checks
 
-Claude Code only learns your usage when it makes a request, so usage from elsewhere (claude.ai, the desktop app) doesn't show up until a session sends something. The ↻ button runs a tiny headless request, `claude -p` on Haiku with no tools, MCP servers, settings or saved session, and reads the fresh numbers from its output. Each click takes a couple of seconds and uses a few hundred Haiku tokens of your plan.
+Claude Code only learns your usage when it makes a request, so usage from elsewhere (claude.ai, the desktop app) wouldn't show up until a session sends something. So every 2 minutes, and whenever you click ↻, the widget asks the same endpoint Claude Code's `/usage` command uses, signed in with the login Claude Code saved in `~/.claude/.credentials.json`. No model runs, so checks don't use any of your plan. The token is only sent to `api.anthropic.com`.
+
+That login expires every few hours, and the widget doesn't renew it itself, since that could conflict with Claude Code. When it finds the login expired, it runs one tiny headless request instead (`claude -p` on Haiku with no tools, MCP servers, settings or saved session). That gets current numbers, and Claude Code renews the login along the way. Automatic checks do this at most every 15 minutes.
+
+The endpoint isn't a documented API, so an update could change it. If checks stop working, the meter still fills from the status line as before. To change how often it checks, set `"poll_minutes"` in `config.json` next to the widget (`0` turns automatic checks off).
 
 ## Requirements
 
@@ -56,7 +60,7 @@ Claude Code only learns your usage when it makes a request, so usage from elsewh
 ## Usage
 
 - **Drag** the title bar to move it; **right-click** anywhere for *Always on top*, *Move to bottom-right*, *Refresh now* and *Exit*.
-- **Click ↻** in the title bar to fetch fresh usage. The status bar shows *Checking usage...* and then the result, or the reason if it failed.
+- **Click ↻** in the title bar to check right away. The status bar shows *Checking usage...* and then the result, or the reason if it failed.
 - Launching it again brings the running window forward instead of opening a second one.
 - **Don't pin it to the taskbar.** Windows shows a pinned item's static shortcut icon, which replaces the live progress icon (and pins bare Python). Use start-at-login instead so the button is always there.
 

@@ -1,8 +1,9 @@
 """Claude Usage Meter: a Windows XP style desktop widget for Claude Code plan usage.
 
 Reads latest.json, which statusline.py writes whenever Claude Code refreshes
-its status line. The refresh button asks Claude Code for fresh numbers with a
-tiny headless Haiku request. Right-click the window for options.
+its status line, and checks the endpoint behind /usage every couple of minutes
+(and when you click the refresh button) with the login Claude Code saved.
+Right-click the window for options.
 """
 import ctypes
 import json
@@ -202,9 +203,61 @@ def claude_exe():
     return path
 
 
-def fetch_usage():
+CREDENTIALS = os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json")
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+POLL_MINUTES = 2
+FALLBACK_GAP = 15 * 60  # automatic checks run the headless request at most this often
+
+
+class LoginExpired(RuntimeError):
+    pass
+
+
+def fetch_api():
+    """Ask the endpoint behind /usage, with the login Claude Code saved. Free: no
+    model runs. The token is only ever sent to api.anthropic.com. Raises
+    LoginExpired when the token needs renewing, RuntimeError otherwise."""
+    import urllib.error
+    import urllib.request
+    try:
+        with open(CREDENTIALS, encoding="utf-8") as f:
+            oauth = json.load(f).get("claudeAiOauth") or {}
+    except (OSError, ValueError, AttributeError):
+        raise RuntimeError("no Claude Code login")
+    token = oauth.get("accessToken")
+    if not token:
+        raise RuntimeError("no Claude Code login")
+    if oauth.get("expiresAt") and oauth["expiresAt"] / 1000 < time.time() + 60:
+        raise LoginExpired("login expired")
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            body = json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise LoginExpired("login expired")
+        raise RuntimeError(f"HTTP {e.code}")
+    except (OSError, ValueError):
+        raise RuntimeError("offline")
+    limits = {}
+    for key in ("five_hour", "seven_day"):
+        win = body.get(key) or {}
+        if win.get("utilization") is None:
+            continue
+        resets_at = win.get("resets_at")
+        if resets_at:
+            resets_at = round(datetime.fromisoformat(resets_at).timestamp())
+        limits[key] = {"used_percentage": float(win["utilization"]), "resets_at": resets_at}
+    if not limits:
+        raise RuntimeError("no usage in reply")
+    return limits
+
+
+def fetch_headless():
     """Run a headless Claude Code request and return its rate limits in the
-    status line format. Raises RuntimeError with a short reason on failure."""
+    status line format. Claude Code renews an expired login as part of it.
+    Raises RuntimeError with a short reason on failure."""
     exe = claude_exe()
     if not exe:
         raise RuntimeError("claude not found")
@@ -260,6 +313,8 @@ class Meter:
         self.fetching = None  # background thread while a refresh runs
         self.fetch_result = None
         self.notice = None  # (text, shown until) for refresh errors
+        self.fetch_manual = False
+        self.last_fallback = 0.0
 
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
@@ -294,6 +349,7 @@ class Meter:
         self.place_initial()
         self.root.after(10, self.show_in_taskbar)
         self.root.after(1000, self.tick)
+        self.root.after(2000, self.auto_refresh)
 
     # ---- window plumbing ----
     def hwnd(self):
@@ -373,20 +429,38 @@ class Meter:
             self.data_mtime = mtime
             self.data = load_json(DATA_FILE, None) if mtime else None
 
-    def refresh(self):
+    def auto_refresh(self):
+        minutes = self.config.get("poll_minutes", POLL_MINUTES)
+        if minutes:
+            self.refresh(manual=False)
+            self.root.after(int(minutes * 60000), self.auto_refresh)
+
+    def refresh(self, manual=True):
         if self.fetching:
             return
-        self.notice = None
+        if manual:
+            self.notice = None
+        self.fetch_manual = manual
         self.fetch_result = None
-        self.fetching = threading.Thread(target=self.fetch_worker, daemon=True)
+        # An expired login is renewed by one headless request; automatic checks
+        # don't repeat that more than every FALLBACK_GAP if it keeps failing.
+        fallback = manual or time.time() - self.last_fallback > FALLBACK_GAP
+        self.fetching = threading.Thread(target=self.fetch_worker, args=(fallback,), daemon=True)
         self.fetching.start()
-        self.draw()
+        if manual:
+            self.draw()
         self.root.after(100, self.poll_fetch)
 
-    def fetch_worker(self):
+    def fetch_worker(self, fallback):
         # Runs off the Tk thread; poll_fetch picks up the result.
         try:
-            self.fetch_result = ("ok", fetch_usage())
+            try:
+                self.fetch_result = ("ok", fetch_api())
+            except LoginExpired:
+                if not fallback:
+                    raise
+                self.last_fallback = time.time()
+                self.fetch_result = ("ok", fetch_headless())
         except RuntimeError as e:
             self.fetch_result = ("error", str(e))
 
@@ -398,7 +472,8 @@ class Meter:
         status, value = self.fetch_result or ("error", "request failed")
         if status == "ok":
             statusline.save(value, fresh=True)
-        else:
+            self.notice = None
+        elif self.fetch_manual:
             self.notice = (f"Refresh failed: {value}", time.time() + 15)
         self.reload(force=True)
         self.draw()
@@ -620,7 +695,7 @@ class Meter:
         c.create_line(SIDE, top + 1, W - SIDE, top + 1, fill="white")
         if self.notice and now > self.notice[1]:
             self.notice = None
-        if self.fetching:
+        if self.fetching and self.fetch_manual:
             text, color = "Checking usage...", TEXT
         elif self.notice:
             text, color = self.notice[0], "#C9431F"
