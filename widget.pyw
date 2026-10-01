@@ -205,7 +205,7 @@ def claude_exe():
 
 CREDENTIALS = os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json")
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-POLL_MINUTES = 2
+POLL_MINUTES = 0.5
 FALLBACK_GAP = 15 * 60  # automatic checks run the headless request at most this often
 KEEPALIVE_GAP = 10 * 60  # keep-alive sends at most one request per this long, even if it fails
 

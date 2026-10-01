@@ -24,7 +24,7 @@ Claude Code only learns your usage when it makes a request, so usage from elsewh
 
 That login expires every few hours, and the widget doesn't renew it itself, since that could conflict with Claude Code. When it finds the login expired, it runs one tiny headless request instead (`claude -p` on Haiku with no tools, MCP servers, settings or saved session). That gets current numbers, and Claude Code renews the login along the way. Automatic checks do this at most every 15 minutes.
 
-The endpoint isn't a documented API, so an update could change it. If it stops working, clicking ↻ still gets fresh numbers through the headless request, and the meter still fills from the status line as before. To change how often it checks, set `"poll_minutes"` in `config.json` next to the widget (`0` turns automatic checks off).
+The endpoint isn't a documented API, so an update could change it. If it stops working, clicking ↻ still gets fresh numbers through the headless request, and the meter still fills from the status line as before. To change how often it checks, set `"poll_minutes"` in `config.json` next to the widget (default `0.5`, i.e. every 30 seconds; `0` turns automatic checks off).
 
 ### Keep the 5-hour window running
 
