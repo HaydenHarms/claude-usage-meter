@@ -15,7 +15,7 @@ import threading
 import time
 import tkinter as tk
 from ctypes import wintypes
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import statusline
 
@@ -458,6 +458,13 @@ class Meter:
         if not self.keep_alive.get() or now - self.last_keepalive < KEEPALIVE_GAP:
             return False
         hours = self.keepalive_hours()
+        anchor = self.config.get("keep_alive_anchor")
+        if anchor and now < anchor:
+            return False  # waiting for the chosen start time
+        if hours and anchor:
+            # fixed cycle: slots at anchor + k * hours; send once for the latest one
+            slot = anchor + (now - anchor) // (hours * 3600) * hours * 3600
+            return self.config.get("last_keepalive", 0) < slot
         if hours:
             return now - self.config.get("last_keepalive", 0) >= hours * 3600
         win = ((self.data or {}).get("rate_limits") or {}).get("five_hour")
@@ -691,7 +698,39 @@ class Meter:
                    ).grid(row=3, column=1)
         tk.Label(box, text="hours", font=FONT).grid(row=3, column=2, sticky="w")
 
+        anchor = self.config.get("keep_alive_anchor")
+        use_start = tk.BooleanVar(value=bool(anchor))
+        start_var = tk.StringVar(value=datetime.fromtimestamp(anchor).strftime("%H:%M")
+                                 if anchor else "05:00")
+        tk.Checkbutton(box, text="Start the cycle at", font=FONT, variable=use_start
+                       ).grid(row=4, column=0, sticky="w", pady=(8, 0))
+        tk.Entry(box, width=6, font=FONT, textvariable=start_var
+                 ).grid(row=4, column=1, pady=(8, 0))
+        tk.Label(box, text="(24-hour)", font=FONT, fg="#555555"
+                 ).grid(row=4, column=2, sticky="w", pady=(8, 0))
+        when = (f"First request: {datetime.fromtimestamp(anchor):%a %H:%M}" if anchor
+                else "No start time: begins as soon as you save.")
+        tk.Label(box, text=when, font=FONT, fg="#555555"
+                 ).grid(row=5, column=0, columnspan=3, sticky="w")
+
         def save():
+            if use_start.get():
+                try:
+                    hh, mm = (int(p) for p in start_var.get().strip().split(":"))
+                    first = datetime.now().replace(hour=hh, minute=mm, second=0, microsecond=0)
+                except ValueError:
+                    start_var.set("05:00")
+                    return
+                old = self.config.get("keep_alive_anchor")
+                if old and datetime.fromtimestamp(old).strftime("%H:%M") == first.strftime("%H:%M"):
+                    pass  # same time of day: keep the running schedule
+                else:
+                    if first.timestamp() <= time.time():
+                        first = first + timedelta(days=1)
+                    self.config["keep_alive_anchor"] = first.timestamp()
+                    self.config["last_keepalive"] = 0
+            else:
+                self.config.pop("keep_alive_anchor", None)
             if mode.get() == "interval":
                 try:
                     value = float(hours_var.get())
@@ -707,7 +746,7 @@ class Meter:
             win.destroy()
 
         row = tk.Frame(box)
-        row.grid(row=4, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        row.grid(row=6, column=0, columnspan=3, sticky="e", pady=(10, 0))
         tk.Button(row, text="Save", width=8, font=FONT, command=save).pack(side="left", padx=4)
         tk.Button(row, text="Cancel", width=8, font=FONT,
                   command=lambda: (self.keep_alive.set(self.config.get("keep_alive", False)),
