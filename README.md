@@ -26,6 +26,10 @@ That login expires every few hours, and the widget doesn't renew it itself, sinc
 
 The endpoint isn't a documented API, so an update could change it. If it stops working, clicking ↻ still gets fresh numbers through the headless request, and the meter still fills from the status line as before. To change how often it checks, set `"poll_minutes"` in `config.json` next to the widget (`0` turns automatic checks off).
 
+### Keep the 5-hour window running
+
+Your 5-hour window only starts when you send a request. Turn on **Keep 5-hour window running** in the right-click menu (or set `"keep_alive": true` in `config.json`) and, whenever the window has run out, the widget sends one tiny headless request (the same `claude -p` on Haiku as above) so the next window starts right away, even if you're away from the keyboard. It's off by default, and unlike the free usage checks, each of these does use a sliver of your plan. The widget has to be running and your PC awake; it sends at most one request per 10 minutes.
+
 ## Requirements
 
 - Windows 10 or 11

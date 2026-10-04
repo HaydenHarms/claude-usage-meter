@@ -207,6 +207,7 @@ CREDENTIALS = os.path.join(os.path.expanduser("~"), ".claude", ".credentials.jso
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 POLL_MINUTES = 2
 FALLBACK_GAP = 15 * 60  # automatic checks run the headless request at most this often
+KEEPALIVE_GAP = 10 * 60  # keep-alive sends at most one request per this long, even if it fails
 
 
 class LoginExpired(RuntimeError):
@@ -315,6 +316,7 @@ class Meter:
         self.notice = None  # (text, shown until) for refresh errors
         self.fetch_manual = False
         self.last_fallback = 0.0
+        self.last_keepalive = 0.0
 
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
@@ -332,6 +334,9 @@ class Meter:
         self.menu = tk.Menu(self.root, tearoff=0, font=FONT)
         self.menu.add_checkbutton(label="Always on top", variable=self.topmost,
                                   command=self.toggle_topmost)
+        self.keep_alive = tk.BooleanVar(value=self.config.get("keep_alive", False))
+        self.menu.add_checkbutton(label="Keep 5-hour window running", variable=self.keep_alive,
+                                  command=self.save_config)
         self.menu.add_command(label="Move to bottom-right", command=self.snap_corner)
         self.menu.add_command(label="Refresh now", command=self.refresh)
         self.menu.add_separator()
@@ -397,6 +402,7 @@ class Meter:
 
     def save_config(self):
         self.config["topmost"] = self.topmost.get()
+        self.config["keep_alive"] = self.keep_alive.get()
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.config, f)
@@ -435,7 +441,16 @@ class Meter:
             self.refresh(manual=False)
             self.root.after(int(minutes * 60000), self.auto_refresh)
 
-    def refresh(self, manual=True):
+    def keepalive_due(self, now):
+        """True when keep-alive is on and no 5-hour window is running: the last
+        one's reset time has passed, or no window has ever been seen."""
+        if not self.keep_alive.get() or now - self.last_keepalive < KEEPALIVE_GAP:
+            return False
+        win = ((self.data or {}).get("rate_limits") or {}).get("five_hour")
+        resets_at = (win or {}).get("resets_at")
+        return not resets_at or resets_at <= now
+
+    def refresh(self, manual=True, keepalive=False):
         if self.fetching:
             return
         if manual:
@@ -445,18 +460,25 @@ class Meter:
         # An expired login is renewed by one headless request; automatic checks
         # don't repeat that more than every FALLBACK_GAP if it keeps failing.
         fallback = manual or time.time() - self.last_fallback > FALLBACK_GAP
-        self.fetching = threading.Thread(target=self.fetch_worker, args=(fallback, manual),
-                                         daemon=True)
+        if keepalive:
+            self.last_keepalive = time.time()
+        self.fetching = threading.Thread(target=self.fetch_worker,
+                                         args=(fallback, manual, keepalive), daemon=True)
         self.fetching.start()
         if manual:
             self.draw()
         self.root.after(100, self.poll_fetch)
 
-    def fetch_worker(self, fallback, manual):
+    def fetch_worker(self, fallback, manual, keepalive=False):
         # Runs off the Tk thread; poll_fetch picks up the result. Automatic
         # checks fall back to the headless request only for an expired login;
-        # the button falls back whenever the endpoint check fails.
+        # the button falls back whenever the endpoint check fails. Keep-alive
+        # goes straight to the headless request: it's a real request, and that
+        # is what starts a new 5-hour window.
         try:
+            if keepalive:
+                self.fetch_result = ("ok", fetch_headless())
+                return
             try:
                 self.fetch_result = ("ok", fetch_api())
             except RuntimeError as e:
@@ -483,6 +505,8 @@ class Meter:
 
     def tick(self):
         self.reload()
+        if not self.fetching and self.keepalive_due(time.time()):
+            self.refresh(manual=False, keepalive=True)
         self.draw()
         self.root.after(1000, self.tick)
 
