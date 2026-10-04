@@ -2,7 +2,7 @@
 
 A tiny Windows XP–style desktop widget that shows your Claude Code plan usage — the same 5-hour session and weekly limits you see in `/usage` — live, in the corner of your screen.
 
-![Claude Usage Meter](docs/screenshot.png)
+![Claude Usage Meter](docs/preview.gif)
 
 - **Session and weekly bars** with a reset countdown, turning yellow at 75% and red at 90%
 - **Live taskbar button**: the icon is a mini progress bar that fills with your session usage, and Windows' own taskbar progress indicator tracks it too (hover for both numbers)
