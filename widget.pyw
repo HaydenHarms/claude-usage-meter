@@ -335,8 +335,9 @@ class Meter:
         self.menu.add_checkbutton(label="Always on top", variable=self.topmost,
                                   command=self.toggle_topmost)
         self.keep_alive = tk.BooleanVar(value=self.config.get("keep_alive", False))
-        self.menu.add_checkbutton(label="Keep 5-hour window running", variable=self.keep_alive,
-                                  command=self.save_config)
+        self.settings_win = None
+        self.fetch_keepalive = False
+        self.menu.add_command(label="Settings...", command=self.open_settings)
         self.menu.add_command(label="Move to bottom-right", command=self.snap_corner)
         self.menu.add_command(label="Refresh now", command=self.refresh)
         self.menu.add_separator()
@@ -441,11 +442,24 @@ class Meter:
             self.refresh(manual=False)
             self.root.after(int(minutes * 60000), self.auto_refresh)
 
+    def keepalive_hours(self):
+        """Hours between keep-alive requests, or None to send one whenever the
+        5-hour window has run out."""
+        try:
+            hours = float(self.config.get("keep_alive_hours") or 0)
+        except (TypeError, ValueError):
+            return None
+        return hours if hours > 0 else None
+
     def keepalive_due(self, now):
-        """True when keep-alive is on and no 5-hour window is running: the last
-        one's reset time has passed, or no window has ever been seen."""
+        """True when keep-alive is on and a request is due: every N hours if a
+        cycle is set, otherwise once the 5-hour window's reset time has passed
+        (or no window has ever been seen)."""
         if not self.keep_alive.get() or now - self.last_keepalive < KEEPALIVE_GAP:
             return False
+        hours = self.keepalive_hours()
+        if hours:
+            return now - self.config.get("last_keepalive", 0) >= hours * 3600
         win = ((self.data or {}).get("rate_limits") or {}).get("five_hour")
         resets_at = (win or {}).get("resets_at")
         return not resets_at or resets_at <= now
@@ -460,6 +474,7 @@ class Meter:
         # An expired login is renewed by one headless request; automatic checks
         # don't repeat that more than every FALLBACK_GAP if it keeps failing.
         fallback = manual or time.time() - self.last_fallback > FALLBACK_GAP
+        self.fetch_keepalive = keepalive
         if keepalive:
             self.last_keepalive = time.time()
         self.fetching = threading.Thread(target=self.fetch_worker,
@@ -498,6 +513,9 @@ class Meter:
         if status == "ok":
             statusline.save(value, fresh=True)
             self.notice = None
+            if self.fetch_keepalive:
+                self.config["last_keepalive"] = time.time()
+                self.save_config()
         elif self.fetch_manual:
             self.notice = (f"Refresh failed: {value}", time.time() + 15)
         self.reload(force=True)
@@ -637,9 +655,66 @@ class Meter:
         close_x = W - SIDE - 3 - BTN
         min_x = close_x - BTN - 2
         refresh_x = min_x - BTN - 2
+        settings_x = refresh_x - BTN - 2
+        self.draw_button(settings_x, by, ("#6FA8FF", "#2863E4"), "settings", self.open_settings)
         self.draw_button(refresh_x, by, ("#6FA8FF", "#2863E4"), "refresh", self.refresh)
         self.draw_button(min_x, by, ("#6FA8FF", "#2863E4"), "min", self.minimize)
         self.draw_button(close_x, by, ("#F09A7C", "#C9431F"), "close", self.quit)
+
+    def open_settings(self):
+        if self.settings_win and self.settings_win.winfo_exists():
+            self.settings_win.lift()
+            return
+        win = self.settings_win = tk.Toplevel(self.root)
+        win.title("Settings")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.attributes("-topmost", True)
+        hours = self.keepalive_hours()
+        mode = tk.StringVar(value="interval" if hours else "reset")
+        hours_var = tk.StringVar(value=f"{hours:g}" if hours else "5")
+
+        box = tk.Frame(win, padx=12, pady=10)
+        box.pack()
+        tk.Checkbutton(box, text="Keep my 5-hour window running", font=FONT_BOLD,
+                       variable=self.keep_alive).grid(row=0, column=0, columnspan=3, sticky="w")
+        tk.Label(box, font=FONT, justify="left", fg="#555555", text=(
+            "Sends one tiny headless Claude request so a new window starts\n"
+            "even when you're away. Uses a sliver of your plan each time."
+        )).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        tk.Radiobutton(box, text="When the window runs out", font=FONT, variable=mode,
+                       value="reset").grid(row=2, column=0, columnspan=3, sticky="w")
+        tk.Radiobutton(box, text="Every", font=FONT, variable=mode,
+                       value="interval").grid(row=3, column=0, sticky="w")
+        tk.Spinbox(box, from_=0.5, to=24, increment=0.5, width=5, font=FONT,
+                   textvariable=hours_var, command=lambda: mode.set("interval")
+                   ).grid(row=3, column=1)
+        tk.Label(box, text="hours", font=FONT).grid(row=3, column=2, sticky="w")
+
+        def save():
+            if mode.get() == "interval":
+                try:
+                    value = float(hours_var.get())
+                except ValueError:
+                    value = 0
+                if not 0.25 <= value <= 24:
+                    hours_var.set("5")
+                    return
+                self.config["keep_alive_hours"] = value
+            else:
+                self.config.pop("keep_alive_hours", None)
+            self.save_config()
+            win.destroy()
+
+        row = tk.Frame(box)
+        row.grid(row=4, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        tk.Button(row, text="Save", width=8, font=FONT, command=save).pack(side="left", padx=4)
+        tk.Button(row, text="Cancel", width=8, font=FONT,
+                  command=lambda: (self.keep_alive.set(self.config.get("keep_alive", False)),
+                                   win.destroy())).pack(side="left")
+        win.update_idletasks()
+        win.geometry(f"+{max(self.root.winfo_x() - win.winfo_width() + W, 0)}"
+                     f"+{max(self.root.winfo_y() - win.winfo_height() - 8, 0)}")
 
     def draw_mini_icon(self, x, y):
         c = self.canvas
@@ -657,6 +732,14 @@ class Meter:
         if kind == "close":
             c.create_line(x + 6, y + 6, x + 15, y + 15, fill="white", width=2, tags=tag)
             c.create_line(x + 15, y + 6, x + 6, y + 15, fill="white", width=2, tags=tag)
+        elif kind == "settings":
+            # gear: ring, hub and eight teeth
+            cx, cy = x + 10, y + 10
+            for dx, dy in ((0, -7), (0, 7), (-7, 0), (7, 0), (-5, -5), (5, 5), (-5, 5), (5, -5)):
+                c.create_line(cx + dx * 0.6, cy + dy * 0.6, cx + dx, cy + dy,
+                              fill="white", width=2, tags=tag)
+            c.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, outline="white", width=2, tags=tag)
+            c.create_oval(cx - 1, cy - 1, cx + 1, cy + 1, fill="white", outline="", tags=tag)
         elif kind == "refresh":
             # circular arrow, gap at the top right
             cx, cy = x + 10, y + 11

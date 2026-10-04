@@ -28,7 +28,7 @@ The endpoint isn't a documented API, so an update could change it. If it stops w
 
 ### Keep the 5-hour window running
 
-Your 5-hour window only starts when you send a request. Turn on **Keep 5-hour window running** in the right-click menu (or set `"keep_alive": true` in `config.json`) and, whenever the window has run out, the widget sends one tiny headless request (the same `claude -p` on Haiku as above) so the next window starts right away, even if you're away from the keyboard. It's off by default, and unlike the free usage checks, each of these does use a sliver of your plan. The widget has to be running and your PC awake; it sends at most one request per 10 minutes.
+Your 5-hour window only starts when you send a request. Click the gear button next to ↻ (or right-click → *Settings...*), tick **Keep my 5-hour window running**, and the widget sends one tiny headless request (the same `claude -p` on Haiku as above) so a new window starts even if you're away from the keyboard. Choose the cycle there: **when the window runs out** (the default), or **every N hours** (0.25 to 24). It's off by default, and unlike the free usage checks, each of these uses a sliver of your plan. The widget has to be running and your PC awake; it sends at most one request per 10 minutes. The same settings live in `config.json` as `"keep_alive"` and `"keep_alive_hours"`.
 
 ## Requirements
 
