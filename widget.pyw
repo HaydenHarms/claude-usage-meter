@@ -460,10 +460,9 @@ class Meter:
             start = datetime.fromtimestamp(self.config["keep_alive_anchor"]).strftime("%H:%M")
         return start or None
 
-    def cycle_bounds(self, now):
+    def cycle_bounds(self, now, start):
         """(today's cycle start, next cycle start) as timestamps around now, or
         None when no daily start time is set."""
-        start = self.keepalive_start()
         if not start:
             return None
         try:
@@ -476,15 +475,17 @@ class Meter:
             first -= timedelta(days=1)
         return first.timestamp(), (first + timedelta(days=1)).timestamp()
 
-    def keepalive_due(self, now):
+    def keepalive_due(self, now, settings=None):
         """True when keep-alive is on and a request is due: every N hours if a
         cycle is set, otherwise once the 5-hour window's reset time has passed
         (or no window has ever been seen). With a daily start time, nothing is
-        sent in the 5 hours before it, so no window is still running then."""
+        sent in the 5 hours before it, so no window is still running then.
+        settings is (hours, start, last_keepalive), defaulting to the saved ones."""
         if not self.keep_alive.get() or now - self.last_keepalive < KEEPALIVE_GAP:
             return False
-        hours = self.keepalive_hours()
-        bounds = self.cycle_bounds(now)
+        hours, start, last = settings or (self.keepalive_hours(), self.keepalive_start(),
+                                          self.config.get("last_keepalive", 0))
+        bounds = self.cycle_bounds(now, start)
         if bounds:
             start, next_start = bounds
             if now >= next_start - WINDOW_SECONDS:
@@ -492,12 +493,23 @@ class Meter:
             if hours:
                 # slots at start + k * hours, restarting each day; send once per slot
                 slot = start + (now - start) // (hours * 3600) * hours * 3600
-                return self.config.get("last_keepalive", 0) < slot
+                return last < slot
         if hours:
-            return now - self.config.get("last_keepalive", 0) >= hours * 3600
+            return now - last >= hours * 3600
         win = ((self.data or {}).get("rate_limits") or {}).get("five_hour")
         resets_at = (win or {}).get("resets_at")
         return not resets_at or resets_at <= now
+
+    def next_keepalive(self, settings=None):
+        """When the next keep-alive request goes out, checking minute by minute
+        over the next two days, or None if none is due in that time."""
+        now = time.time()
+        t = now
+        while t < now + 2 * 86400:
+            if self.keepalive_due(t, settings):
+                return max(t, now)
+            t = (t // 60 + 1) * 60
+        return None
 
     def refresh(self, manual=True, keepalive=False):
         if self.fetching:
@@ -735,14 +747,63 @@ class Meter:
                  ).grid(row=4, column=1, pady=(8, 0))
         tk.Label(box, text="(24-hour)", font=FONT, fg="#555555"
                  ).grid(row=4, column=2, sticky="w", pady=(8, 0))
-        if start:
-            quiet = (datetime.strptime(start, "%H:%M")
-                     - timedelta(seconds=WINDOW_SECONDS)).strftime("%H:%M")
-            when = f"Nothing is sent from {quiet} to {start} each day."
-        else:
-            when = "No start time: runs around the clock from when you save."
-        tk.Label(box, text=when, font=FONT, fg="#555555"
-                 ).grid(row=5, column=0, columnspan=3, sticky="w")
+        when = tk.Label(box, font=FONT, fg="#555555")
+        when.grid(row=5, column=0, columnspan=3, sticky="w")
+        next_label = tk.Label(box, font=FONT_BOLD)
+        next_label.grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        def preview(*_):
+            # Shows what the settings in the dialog would do, before they're saved.
+            if not win.winfo_exists():
+                return
+            start = None
+            if use_start.get():
+                try:
+                    hh, mm = (int(p) for p in start_var.get().strip().split(":"))
+                    start = datetime.strptime(f"{hh:02d}:{mm:02d}", "%H:%M").strftime("%H:%M")
+                except ValueError:
+                    when.config(text="Enter the start time as HH:MM.")
+                    next_label.config(text="")
+                    return
+                quiet = (datetime.strptime(start, "%H:%M")
+                         - timedelta(seconds=WINDOW_SECONDS)).strftime("%H:%M")
+                when.config(text=f"Nothing is sent from {quiet} to {start} each day.")
+            else:
+                when.config(text="No start time: runs around the clock from when you save.")
+            hours = None
+            if mode.get() == "interval":
+                try:
+                    hours = float(hours_var.get())
+                except ValueError:
+                    hours = 0
+                if not 0.25 <= hours <= 24:
+                    next_label.config(text="Enter 0.25 to 24 hours.")
+                    return
+            if not self.keep_alive.get():
+                next_label.config(text="Keep-alive is off.")
+                return
+            last = self.config.get("last_keepalive", 0) if start == self.keepalive_start() else 0
+            t = self.next_keepalive((hours, start, last))
+            if t is None:
+                next_label.config(text="No message due in the next two days.")
+            elif t - time.time() < 60:
+                next_label.config(text="Next message sent: right away")
+            else:
+                next_label.config(text=f"Next message sent at {clock(t)}, "
+                                       f"{datetime.fromtimestamp(t):%a %b} "
+                                       f"{datetime.fromtimestamp(t).day}")
+
+        def keep_previewing():
+            if win.winfo_exists():
+                preview()
+                win.after(30000, keep_previewing)
+
+        for var in (mode, hours_var, use_start, start_var):
+            var.trace_add("write", preview)
+        trace = self.keep_alive.trace_add("write", preview)
+        win.bind("<Destroy>", lambda e: e.widget is win
+                 and self.keep_alive.trace_remove("write", trace))
+        keep_previewing()
 
         def save():
             if use_start.get():
@@ -774,7 +835,7 @@ class Meter:
             win.destroy()
 
         row = tk.Frame(box)
-        row.grid(row=6, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        row.grid(row=7, column=0, columnspan=3, sticky="e", pady=(10, 0))
         tk.Button(row, text="Save", width=8, font=FONT, command=save).pack(side="left", padx=4)
         tk.Button(row, text="Cancel", width=8, font=FONT,
                   command=lambda: (self.keep_alive.set(self.config.get("keep_alive", False)),
