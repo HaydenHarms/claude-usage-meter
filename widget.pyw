@@ -208,6 +208,7 @@ USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 POLL_MINUTES = 0.5
 FALLBACK_GAP = 15 * 60  # automatic checks run the headless request at most this often
 KEEPALIVE_GAP = 10 * 60  # keep-alive sends at most one request per this long, even if it fails
+WINDOW_SECONDS = 5 * 3600  # length of the session window keep-alive starts
 
 
 class LoginExpired(RuntimeError):
@@ -451,20 +452,47 @@ class Meter:
             return None
         return hours if hours > 0 else None
 
+    def keepalive_start(self):
+        """Daily start time as "HH:MM", or None. Older configs stored a one-off
+        timestamp; its time of day carries over."""
+        start = self.config.get("keep_alive_start")
+        if not start and self.config.get("keep_alive_anchor"):
+            start = datetime.fromtimestamp(self.config["keep_alive_anchor"]).strftime("%H:%M")
+        return start or None
+
+    def cycle_bounds(self, now):
+        """(today's cycle start, next cycle start) as timestamps around now, or
+        None when no daily start time is set."""
+        start = self.keepalive_start()
+        if not start:
+            return None
+        try:
+            hh, mm = (int(p) for p in start.split(":"))
+            first = datetime.fromtimestamp(now).replace(hour=hh, minute=mm,
+                                                        second=0, microsecond=0)
+        except ValueError:
+            return None
+        if first.timestamp() > now:
+            first -= timedelta(days=1)
+        return first.timestamp(), (first + timedelta(days=1)).timestamp()
+
     def keepalive_due(self, now):
         """True when keep-alive is on and a request is due: every N hours if a
         cycle is set, otherwise once the 5-hour window's reset time has passed
-        (or no window has ever been seen)."""
+        (or no window has ever been seen). With a daily start time, nothing is
+        sent in the 5 hours before it, so no window is still running then."""
         if not self.keep_alive.get() or now - self.last_keepalive < KEEPALIVE_GAP:
             return False
         hours = self.keepalive_hours()
-        anchor = self.config.get("keep_alive_anchor")
-        if anchor and now < anchor:
-            return False  # waiting for the chosen start time
-        if hours and anchor:
-            # fixed cycle: slots at anchor + k * hours; send once for the latest one
-            slot = anchor + (now - anchor) // (hours * 3600) * hours * 3600
-            return self.config.get("last_keepalive", 0) < slot
+        bounds = self.cycle_bounds(now)
+        if bounds:
+            start, next_start = bounds
+            if now >= next_start - WINDOW_SECONDS:
+                return False  # quiet until the next start time
+            if hours:
+                # slots at start + k * hours, restarting each day; send once per slot
+                slot = start + (now - start) // (hours * 3600) * hours * 3600
+                return self.config.get("last_keepalive", 0) < slot
         if hours:
             return now - self.config.get("last_keepalive", 0) >= hours * 3600
         win = ((self.data or {}).get("rate_limits") or {}).get("five_hour")
@@ -698,18 +726,21 @@ class Meter:
                    ).grid(row=3, column=1)
         tk.Label(box, text="hours", font=FONT).grid(row=3, column=2, sticky="w")
 
-        anchor = self.config.get("keep_alive_anchor")
-        use_start = tk.BooleanVar(value=bool(anchor))
-        start_var = tk.StringVar(value=datetime.fromtimestamp(anchor).strftime("%H:%M")
-                                 if anchor else "05:00")
-        tk.Checkbutton(box, text="Start the cycle at", font=FONT, variable=use_start
+        start = self.keepalive_start()
+        use_start = tk.BooleanVar(value=bool(start))
+        start_var = tk.StringVar(value=start or "05:00")
+        tk.Checkbutton(box, text="Start the cycle daily at", font=FONT, variable=use_start
                        ).grid(row=4, column=0, sticky="w", pady=(8, 0))
         tk.Entry(box, width=6, font=FONT, textvariable=start_var
                  ).grid(row=4, column=1, pady=(8, 0))
         tk.Label(box, text="(24-hour)", font=FONT, fg="#555555"
                  ).grid(row=4, column=2, sticky="w", pady=(8, 0))
-        when = (f"First request: {datetime.fromtimestamp(anchor):%a %H:%M}" if anchor
-                else "No start time: begins as soon as you save.")
+        if start:
+            quiet = (datetime.strptime(start, "%H:%M")
+                     - timedelta(seconds=WINDOW_SECONDS)).strftime("%H:%M")
+            when = f"Nothing is sent from {quiet} to {start} each day."
+        else:
+            when = "No start time: runs around the clock from when you save."
         tk.Label(box, text=when, font=FONT, fg="#555555"
                  ).grid(row=5, column=0, columnspan=3, sticky="w")
 
@@ -717,20 +748,17 @@ class Meter:
             if use_start.get():
                 try:
                     hh, mm = (int(p) for p in start_var.get().strip().split(":"))
-                    first = datetime.now().replace(hour=hh, minute=mm, second=0, microsecond=0)
+                    value = f"{hh:02d}:{mm:02d}"
+                    datetime.strptime(value, "%H:%M")
                 except ValueError:
                     start_var.set("05:00")
                     return
-                old = self.config.get("keep_alive_anchor")
-                if old and datetime.fromtimestamp(old).strftime("%H:%M") == first.strftime("%H:%M"):
-                    pass  # same time of day: keep the running schedule
-                else:
-                    if first.timestamp() <= time.time():
-                        first = first + timedelta(days=1)
-                    self.config["keep_alive_anchor"] = first.timestamp()
+                if value != self.keepalive_start():
                     self.config["last_keepalive"] = 0
+                self.config["keep_alive_start"] = value
             else:
-                self.config.pop("keep_alive_anchor", None)
+                self.config.pop("keep_alive_start", None)
+            self.config.pop("keep_alive_anchor", None)
             if mode.get() == "interval":
                 try:
                     value = float(hours_var.get())
