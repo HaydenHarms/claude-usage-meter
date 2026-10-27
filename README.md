@@ -78,4 +78,4 @@ Your 5-hour window only starts when you send a request. Click the gear button ne
 
 ## License
 
-[MIT](LICENSE)
+[MPL-2.0](LICENSE)
